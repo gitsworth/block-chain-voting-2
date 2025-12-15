@@ -57,20 +57,33 @@ if 'st.session_state.db' not in st.session_state:
             st.warning("⚠️ Environment variables are missing. Firestore connectivity is disabled. Using a Mock DB. Persistence and multi-user features will NOT work.")
             
             # Define simple mock objects that allow subsequent code to call .collection().document().set() without crashing
-            class MockDocument:
-                def __init__(self, doc_id):
-                    self.doc_id = doc_id
-                def set(self, data): print(f"MOCK DB: Setting document {self.doc_id}")
-                def get(self): return self
-                def to_dict(self): return None # Returns None to simulate doc not found
-                def update(self, data): print(f"MOCK DB: Updating document {self.doc_id}")
-            
+
+            class MockRef:
+                id = "mock_new_doc_id"
+
             class MockCollection:
-                def document(self, doc_id): return MockDocument(doc_id)
+                def document(self, doc_id=None): return MockDocument(doc_id)
                 def stream(self): return []
                 def order_by(self, field): return self
                 def where(self, field, op, value): return self
-            
+                def limit(self, count): return self # Added limit for queries
+                def get(self): return [MockDocument(f"mock_doc_{i}") for i in range(2)] 
+                def add(self, data):
+                    print(f"MOCK DB: Adding new document to collection.")
+                    return MockRef(), None # (ref, update_time)
+
+            class MockDocument:
+                def __init__(self, doc_id=None):
+                    self.doc_id = doc_id
+                def set(self, data): print(f"MOCK DB: Setting document {self.doc_id if self.doc_id else 'New Doc'}")
+                def get(self): return self
+                def to_dict(self): return None 
+                def update(self, data): print(f"MOCK DB: Updating document {self.doc_id}")
+                # --- FIX: Added collection() method to resolve AttributeError ---
+                def collection(self, name): 
+                    print(f"MOCK DB: Accessing collection '{name}' under document '{self.doc_id}'")
+                    return MockCollection()
+
             class MockDB:
                 def collection(self, name): return MockCollection()
             
