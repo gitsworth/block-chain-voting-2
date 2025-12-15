@@ -9,25 +9,37 @@ appId = "default-app-id" # Fallback if not defined
 firebaseConfig = {}
 initialAuthToken = None
 
-# Check for environment variables (Canvas environment provides these)
+# Check for environment variables and ensure initialization happens once
 if 'st.session_state.db' not in st.session_state:
     if hasattr(st, '__app_id'):
         appId = st.__app_id
+    
     if hasattr(st, '__firebase_config'):
-        firebaseConfig = json.loads(st.__firebase_config)
+        try:
+            # Parse the configuration string provided by the environment
+            firebaseConfig = json.loads(st.__firebase_config)
+        except json.JSONDecodeError:
+            st.error("Fatal Error: __firebase_config is not valid JSON.")
+            st.stop()
+    else:
+        st.error("Fatal Error: __firebase_config environment variable is missing.")
+        st.stop()
+        
     if hasattr(st, '__initial_auth_token'):
         initialAuthToken = st.__initial_auth_token
 
     # --- Initialize Firebase and Authentication ---
     try:
         if not firebase_admin._apps:
-            # Firestore needs credentials for server-side initialization
+            # This line requires the JSON content of a Firebase Service Account key file.
+            # The error 'Certificate must contain a "type" field set to "service_account"'
+            # means the 'firebaseConfig' dictionary does not have this field.
             cred = credentials.Certificate(firebaseConfig)
             firebase_admin.initialize_app(cred, name=appId)
         
         db = firestore.client(app=firebase_admin.get_app(appId))
         
-        # We will use the app ID as the user ID for simplicity in this centralized host system
+        # We use the app ID as a pseudo-user ID for the centralized host system
         user_id = appId 
         
         st.session_state.db = db
