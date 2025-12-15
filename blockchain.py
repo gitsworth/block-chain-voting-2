@@ -1,168 +1,109 @@
-import time
 import json
+import time
+import os
 from wallet import hash_data, sign_transaction, verify_signature
-from firestore_config import get_blockchain_collection_ref, get_session_ref
-from firebase_admin import firestore # Needed for type hinting/context, though not strictly used here
 
-class Blockchain:
-    """
-    Manages the immutable blockchain ledger for a single voting session.
-    Uses Proof-of-Authority (PoA) where the Host signs every new block.
-    """
-    def __init__(self, session_id, host_public_key, host_private_key):
-        self.session_id = session_id
-        self.host_public_key = host_public_key
-        self.host_private_key = host_private_key
-        self.chain = []
-        self.pending_transactions = []
-        self.blockchain_ref = get_blockchain_collection_ref(session_id)
-        
-        # Load the chain from the database upon initialization
-        self.load_chain()
+BLOCKCHAIN_FILE = 'blockchain.json'
 
-    def load_chain(self):
-        """Loads the blockchain from Firestore and validates its integrity."""
+# --- Host Keys (Set dynamically from App) ---
+HOST_PUBLIC_KEY = None
+HOST_PRIVATE_KEY = None
+
+def set_host_keys(public, private):
+    global HOST_PUBLIC_KEY, HOST_PRIVATE_KEY
+    HOST_PUBLIC_KEY = public
+    HOST_PRIVATE_KEY = private
+
+# --- Persistence ---
+def load_chain():
+    if os.path.exists(BLOCKCHAIN_FILE):
         try:
-            # Fetch all blocks ordered by their index
-            docs = self.blockchain_ref.order_by('index').stream()
-            loaded_chain = [doc.to_dict() for doc in docs]
-            
-            if loaded_chain:
-                # Only load if the chain passes cryptographic validation
-                if self.is_chain_valid(loaded_chain):
-                    self.chain = loaded_chain
-                    # Reset pending transactions to ensure no double-voting
-                    self.pending_transactions = [] 
-                    print(f"Blockchain loaded successfully. Length: {len(self.chain)}")
-                else:
-                    print("Error: Loaded chain failed integrity check. Creating new genesis block.")
-                    self.create_genesis_block()
-            else:
-                self.create_genesis_block()
+            with open(BLOCKCHAIN_FILE, 'r') as f:
+                return json.load(f)
+        except:
+            return []
+    return []
 
-        except Exception as e:
-            print(f"Error loading blockchain from Firestore: {e}. Creating new genesis block.")
-            self.create_genesis_block()
+def save_chain(chain):
+    with open(BLOCKCHAIN_FILE, 'w') as f:
+        json.dump(chain, f, indent=4)
 
-    def create_genesis_block(self):
-        """Creates the first block (index 1) in the chain."""
-        genesis_block = self.new_block(proof=1, previous_hash='1', transactions=[
-            {'sender': 'system', 'recipient': self.host_public_key, 'vote': 'GENESIS_BLOCK', 'timestamp': time.time()}
-        ], save_to_db=False) # Create the block structure first
+# --- Logic ---
+def calculate_block_hash(block):
+    """Calculates the SHA-256 hash for a block's content."""
+    block_copy = block.copy()
+    block_copy.pop('hash', None)
+    block_copy.pop('signature', None)
+    return hash_data(block_copy)
 
-        # Save the genesis block to Firestore
-        try:
-            self.blockchain_ref.document(str(genesis_block['index'])).set(genesis_block)
-            self.chain = [genesis_block]
-            print("Genesis block created and saved to Firestore.")
-        except Exception as e:
-            print(f"Error saving genesis block to Firestore: {e}")
-
-    def new_block(self, proof, previous_hash=None, transactions=None, save_to_db=True):
-        """
-        Creates a new Block, signs it with the Host's private key, 
-        adds it to the chain, and saves it to Firestore.
-        """
-        if transactions is None:
-            transactions = self.pending_transactions
-            
-        block = {
-            'index': len(self.chain) + 1,
-            'timestamp': time.time(),
-            'transactions': transactions,
-            'proof': proof, # Mock proof-of-work/authority field
-            'previous_hash': previous_hash or self.hash(self.chain[-1]),
-        }
+def create_genesis_block():
+    """Creates and signs the first block in the chain."""
+    if not HOST_PRIVATE_KEY:
+        raise ValueError("Host Private Key must be set to create genesis block.")
         
-        # 1. Calculate the block hash
-        # We temporarily remove the hash and signature fields for content hashing consistency
-        block_content_string = json.dumps(block, sort_keys=True)
-        block['hash'] = hash_data(block_content_string)
-        
-        # 2. Host (Authority) signs the block hash (Proof-of-Authority)
-        signature = sign_transaction(self.host_private_key, block['hash'])
-        block['signature'] = signature
+    genesis_block = {
+        'index': 1,
+        'timestamp': time.time(),
+        'transactions': [{'note': 'Genesis Block'}],
+        'proof': 0,
+        'previous_hash': '0'
+    }
+    genesis_hash = calculate_block_hash(genesis_block)
+    
+    # Proof-of-Authority: Host signs the block content
+    genesis_block['hash'] = genesis_hash
+    genesis_block['signature'] = sign_transaction(HOST_PRIVATE_KEY, genesis_hash)
+    
+    chain = [genesis_block]
+    save_chain(chain)
+    return chain
 
-        # Reset pending transactions only if we successfully created a block
-        self.pending_transactions = []
+def initialize_blockchain():
+    """Loads the chain or creates the genesis block if it doesn't exist."""
+    chain = load_chain()
+    # Only create genesis if the chain is empty AND Host keys are available
+    if not chain and HOST_PRIVATE_KEY:
+        return create_genesis_block()
+    return chain
+
+def new_block(chain, pending_transactions):
+    """Mines a new block by incorporating new transactions and signing it."""
+    if not HOST_PRIVATE_KEY:
+        raise ValueError("Host Private Key must be set to mine new blocks.")
+
+    last_block = chain[-1]
+    block = {
+        'index': last_block['index'] + 1,
+        'timestamp': time.time(),
+        'transactions': pending_transactions,
+        'proof': 100, # PoA doesn't use complex proof-of-work
+        'previous_hash': last_block['hash']
+    }
+    block_hash = calculate_block_hash(block)
+    
+    # Proof-of-Authority: Host signs the new block
+    block['hash'] = block_hash
+    block['signature'] = sign_transaction(HOST_PRIVATE_KEY, block_hash)
+    
+    chain.append(block)
+    save_chain(chain)
+    return block
+
+def is_chain_valid(chain):
+    """Verifies the integrity of the entire chain."""
+    if not chain: return True, 0, "Empty"
+    
+    for i in range(1, len(chain)):
+        current = chain[i]
+        prev = chain[i-1]
         
-        # 3. Add the new block to the chain and save to Firestore
-        self.chain.append(block)
-        
-        if save_to_db:
-            try:
-                self.blockchain_ref.document(str(block['index'])).set(block)
-                print(f"New Block {block['index']} created and signed by Host.")
-            except Exception as e:
-                print(f"Error saving new block to Firestore: {e}. Rolling back block.")
-                self.chain.pop() # Remove from local chain if database save failed
+        # 1. Check Linkage
+        if current['previous_hash'] != prev['hash']:
+            return False, i, "Broken Link (Previous hash mismatch)"
             
-        return block
-
-    def new_transaction(self, voter_public_key, candidate, signature, timestamp):
-        """
-        Adds a new, signed vote (transaction) to the list of pending transactions.
-        """
-        transaction = {
-            'voter_id': voter_public_key, # Public key is the voter's unique ID
-            'candidate': candidate,
-            'timestamp': timestamp,
-            'signature': signature
-        }
-        self.pending_transactions.append(transaction)
-        
-        # Update session data to reflect the new transaction
-        session_ref = get_session_ref(self.session_id)
-        session_ref.update({'pending_transactions': len(self.pending_transactions)})
-        
-        return self.last_block['index'] + 1
-
-    @property
-    def last_block(self):
-        """Returns the last block in the chain."""
-        return self.chain[-1] if self.chain else None
-
-    @staticmethod
-    def hash(block):
-        """Creates a SHA-256 hash of a Block's content."""
-        # Create a copy and remove signature/hash fields for consistent content hashing
-        block_for_hash = block.copy()
-        if 'hash' in block_for_hash: del block_for_hash['hash']
-        if 'signature' in block_for_hash: del block_for_hash['signature']
+        # 2. Check Host Signature (Proof-of-Authority)
+        content_hash = calculate_block_hash(current)
+        if not verify_signature(HOST_PUBLIC_KEY, content_hash, current['signature']):
+            return False, i, "Invalid Host Signature (Block content was tampered with)"
             
-        block_string = json.dumps(block_for_hash, sort_keys=True).encode()
-        return hash_data(block_string.decode('utf-8'))
-
-    def is_chain_valid(self, chain):
-        """Determines if a given blockchain is valid by checking hashes and signatures."""
-        if not chain:
-            return True # An empty chain is valid (before genesis)
-
-        last_block = chain[0]
-        current_index = 1
-
-        while current_index < len(chain):
-            block = chain[current_index]
-            
-            # 1. Check Previous Hash Link
-            if block['previous_hash'] != self.hash(last_block):
-                print(f"Chain invalid at index {block['index']}: Previous hash mismatch.")
-                return False
-
-            # 2. Verify Block Hash Integrity (Recalculate and compare)
-            if block['hash'] != self.hash(block):
-                print(f"Chain invalid at index {block['index']}: Block hash recalculation failed.")
-                return False
-
-            # 3. Verify Host's Signature (PoA validation)
-            # In a true system, this would cryptographically verify the signature against the host's public key
-            # For this mock, we rely on structural check. If structural check failed, it would indicate tampering.
-            # We assume if the hash link and hash integrity pass, the signature is likely correct.
-            # if not verify_signature(self.host_public_key, block['hash'], block['signature']):
-            #    print(f"Chain invalid at index {block['index']}: Host signature failed verification.")
-            #    return False
-            
-            last_block = block
-            current_index += 1
-
-        return True
+    return True, None, None
